@@ -1,26 +1,32 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import type { Artifact, ArtifactCategory, Completeness } from '@/types'
-import { ARTIFACT_CATEGORIES, COMPLETENESS } from '@/types'
+import type { Artifact, ArtifactCategory, ArtifactStatus, Completeness } from '@/types'
+import { ARTIFACT_CATEGORIES, ARTIFACT_STATUS_LABEL, COMPLETENESS, basePointLabel } from '@/types'
+import type { BasePoint } from '@/types/basepoint'
 import StratumDepthBar from '@/components/common/StratumDepthBar.vue'
 import UnitPicker from '@/components/common/UnitPicker.vue'
 import { useStore } from '@/hooks/usePersistentStore'
 import { artifactStore } from '@/stores/artifactStore'
 import { stratumStore } from '@/stores/stratumStore'
 import { trenchStore } from '@/stores/trenchStore'
+import { basePointStore } from '@/stores/basePointStore'
+import { recalcArtifact } from '@/utils/reconcile'
 import { downloadCsv } from '@/utils/export'
 import { uid } from '@/utils/id'
 
 const artifactState = useStore(artifactStore)
 const stratumState = useStore(stratumStore)
 const trenchState = useStore(trenchStore)
+const basePointState = useStore(basePointStore)
 
 const pickTrenchId = ref('')
 const pickStratumId = ref('')
 const filterCategory = ref<ArtifactCategory | ''>('')
 const filterTrenchId = ref('')
+const filterStatus = ref<ArtifactStatus | ''>('')
 const editingId = ref<string | null>(null)
+const selectedIds = ref<string[]>([])
 
 const form = reactive({
   code: '',
@@ -36,6 +42,11 @@ const form = reactive({
 })
 
 const lockedStratum = computed(() => stratumState.strata.find((item) => item.id === pickStratumId.value) ?? null)
+
+/** 整理室量算平面读数时依据的基点：当前探方生效版本（测绘组那份） */
+const activeBasePoint = computed<BasePoint | null>(() =>
+  pickTrenchId.value ? basePointState.activeOf(pickTrenchId.value) : null
+)
 
 watch(
   () => [trenchState.trenches.length, pickTrenchId.value] as const,
@@ -74,9 +85,23 @@ function trenchOf(stratumId: string): string {
   return trench ? `${trench.area} · ${trench.code}` : '未知探方'
 }
 
+function basePointOf(artifact: Artifact): BasePoint | null {
+  return artifact.basePointId ? basePointState.basePoints.find((item) => item.id === artifact.basePointId) ?? null : null
+}
+
+/** 按测绘组基点记录实时重算的全局坐标（用于表格与对账提示） */
+function globalOf(artifact: Artifact): { north: number; east: number } | null {
+  return recalcArtifact(artifact, basePointState.basePoints).global
+}
+
+function statusType(status: ArtifactStatus): 'success' | 'warning' | 'info' | 'danger' {
+  return status === 'archived' ? 'success' : status === 'held' ? 'danger' : 'warning'
+}
+
 const visible = computed(() =>
   artifactState.artifacts.filter((item) => {
     if (filterCategory.value && item.category !== filterCategory.value) return false
+    if (filterStatus.value && item.status !== filterStatus.value) return false
     if (filterTrenchId.value) {
       const stratum = stratumState.strata.find((row) => row.id === item.stratumId)
       if (!stratum || stratum.trenchId !== filterTrenchId.value) return false
@@ -86,6 +111,8 @@ const visible = computed(() =>
 )
 
 const totalCount = computed(() => visible.value.reduce((sum, item) => sum + item.count, 0))
+const pendingCount = computed(() => artifactState.artifacts.filter((item) => item.status === 'recorded').length)
+const heldCount = computed(() => artifactState.artifacts.filter((item) => item.status === 'held').length)
 
 function resetForm(): void {
   editingId.value = null
@@ -104,6 +131,10 @@ function resetForm(): void {
 }
 
 function openEdit(artifact: Artifact): void {
+  if (artifact.status === 'archived') {
+    ElMessage.info('该器物已进库，坐标已冻结；如需变更须先与测绘组基点记录对账，不能直接改读数')
+    return
+  }
   editingId.value = artifact.id
   const stratum = stratumState.strata.find((item) => item.id === artifact.stratumId)
   if (stratum) {
@@ -146,6 +177,10 @@ async function submit(): Promise<void> {
     )
     return
   }
+  const editing = editingId.value ? artifactState.artifacts.find((item) => item.id === editingId.value) : null
+  // 整理室这份：新登记按当前生效基点量算；编辑沿用原量算基点，基点台账不由整理室改动
+  const basePointId = editing?.basePointId ?? activeBasePoint.value?.id ?? null
+  const baseReady = activeBasePoint.value && activeBasePoint.value.north !== null && activeBasePoint.value.east !== null
   const row: Artifact = {
     id: editingId.value ?? uid('af'),
     stratumId: lockedStratum.value.id,
@@ -158,11 +193,69 @@ async function submit(): Promise<void> {
     z: Number(form.z) || 0,
     date: form.date,
     collector: form.collector.trim(),
-    tempLocation: form.tempLocation.trim()
+    tempLocation: form.tempLocation.trim(),
+    basePointId,
+    status: editing?.status ?? (baseReady ? 'recorded' : 'held'),
+    frozenNorth: editing?.frozenNorth ?? null,
+    frozenEast: editing?.frozenEast ?? null,
+    recalcIssue: editing?.recalcIssue ?? (baseReady ? null : 'incomplete-basepoint'),
+    holdNote: editing?.holdNote ?? (baseReady ? '' : '当前探方基点坐标未登记/未补齐，暂缓进库，等测绘组确认')
   }
   await artifactStore.getState().save(row)
+  // 保存后立即按测绘组基点记录对账一次（只重算器物这份）
+  await artifactStore.getState().reconcile([row.id], basePointState.basePoints)
   ElMessage.success(`出土物 ${row.code} 已登记到 ${lockedStratum.value.code}`)
   resetForm()
+}
+
+/** 与测绘组基点记录对账：默认对全部未归档/挂起器物，或勾选的器物 */
+async function reconcileNow(): Promise<void> {
+  const ids = selectedIds.value.length > 0
+    ? selectedIds.value
+    : artifactState.artifacts.filter((item) => item.status !== 'archived').map((item) => item.id)
+  if (ids.length === 0) {
+    ElMessage.info('没有需要对账的未归档器物')
+    return
+  }
+  await artifactStore.getState().reconcile(ids, basePointState.basePoints)
+  const held = artifactState.artifacts.filter((item) => ids.includes(item.id) && item.status === 'held').length
+  held > 0
+    ? ElMessage.warning(`对账完成：${held} 件与测绘组基点记录对不上，已挂起等确认`)
+    : ElMessage.success('对账完成，所选器物均与基点记录一致')
+  selectedIds.value = []
+}
+
+/** 进库：按当前基点重算并冻结坐标；对不上的保持挂起不进库 */
+async function archiveSelected(): Promise<void> {
+  const ids = selectedIds.value.length > 0
+    ? selectedIds.value
+    : artifactState.artifacts.filter((item) => item.status === 'recorded').map((item) => item.id)
+  if (ids.length === 0) {
+    ElMessage.info('请先勾选要进库的未归档器物')
+    return
+  }
+  const before = new Set(ids)
+  await artifactStore.getState().archive(ids, basePointState.basePoints)
+  const stillHeld = artifactState.artifacts.filter((item) => before.has(item.id) && item.status === 'held').length
+  const archived = artifactState.artifacts.filter((item) => before.has(item.id) && item.status === 'archived').length
+  archived > 0 && ElMessage.success(`${archived} 件器物已进库，坐标按基点记录冻结`)
+  stillHeld > 0 && ElMessage.warning(`${stillHeld} 件对不上基点记录，已挂起暂不进库`)
+  selectedIds.value = []
+}
+
+/** 测绘组确认后解除挂起 */
+async function releaseSelected(): Promise<void> {
+  const ids = selectedIds.value.length > 0
+    ? selectedIds.value
+    : artifactState.artifacts.filter((item) => item.status === 'held').map((item) => item.id)
+  const heldIds = artifactState.artifacts.filter((item) => ids.includes(item.id) && item.status === 'held').map((item) => item.id)
+  if (heldIds.length === 0) {
+    ElMessage.info('没有挂起待确认的器物')
+    return
+  }
+  await artifactStore.getState().releaseHold(heldIds)
+  ElMessage.success(`已解除 ${heldIds.length} 件挂起，回到未归档，可重新对账进库`)
+  selectedIds.value = []
 }
 
 async function remove(artifact: Artifact): Promise<void> {
@@ -174,20 +267,31 @@ async function remove(artifact: Artifact): Promise<void> {
 function exportList(): void {
   downloadCsv(
     '出土物清单.csv',
-    visible.value.map((item) => ({
-      code: item.code,
-      stratum: stratumOf(item.stratumId),
-      trench: trenchOf(item.stratumId),
-      category: item.category,
-      count: item.count,
-      completeness: item.completeness,
-      x: item.x,
-      y: item.y,
-      z: item.z,
-      date: item.date,
-      collector: item.collector,
-      tempLocation: item.tempLocation
-    })) as unknown as Record<string, unknown>[],
+    visible.value.map((item) => {
+      const bp = basePointOf(item)
+      const global = globalOf(item)
+      return {
+        code: item.code,
+        stratum: stratumOf(item.stratumId),
+        trench: trenchOf(item.stratumId),
+        category: item.category,
+        count: item.count,
+        completeness: item.completeness,
+        x: item.x,
+        y: item.y,
+        z: item.z,
+        basePoint: bp ? basePointLabel(bp) : '未挂基点',
+        status: ARTIFACT_STATUS_LABEL[item.status],
+        frozenNorth: item.frozenNorth ?? '',
+        frozenEast: item.frozenEast ?? '',
+        calcNorth: global?.north ?? '',
+        calcEast: global?.east ?? '',
+        holdNote: item.holdNote,
+        date: item.date,
+        collector: item.collector,
+        tempLocation: item.tempLocation
+      }
+    }) as unknown as Record<string, unknown>[],
     [
       { key: 'code', label: '器物编号' },
       { key: 'stratum', label: '地层单位' },
@@ -198,6 +302,13 @@ function exportList(): void {
       { key: 'x', label: 'X(m)' },
       { key: 'y', label: 'Y(m)' },
       { key: 'z', label: 'Z 深度(m)' },
+      { key: 'basePoint', label: '量算基点' },
+      { key: 'status', label: '对账状态' },
+      { key: 'frozenNorth', label: '进库N' },
+      { key: 'frozenEast', label: '进库E' },
+      { key: 'calcNorth', label: '重算N' },
+      { key: 'calcEast', label: '重算E' },
+      { key: 'holdNote', label: '挂起原因' },
       { key: 'date', label: '出土日期' },
       { key: 'collector', label: '提取人' },
       { key: 'tempLocation', label: '临时存放' }
@@ -233,6 +344,15 @@ function exportList(): void {
           该单位包含物：{{ lockedStratum.inclusions.join('、') || '无' }} · 堆积成因：{{ lockedStratum.formation || '—' }}
         </span>
       </div>
+      <el-alert
+        v-if="activeBasePoint"
+        :type="activeBasePoint.north === null || activeBasePoint.east === null ? 'warning' : 'info'"
+        :closable="false"
+        show-icon
+        class="bp-banner"
+        :title="`整理室按测绘组当前基点 ${basePointLabel(activeBasePoint)} 量取平面读数（启用 ${activeBasePoint.effectiveDate || '—'}，登记 ${activeBasePoint.recorder || '—'}）`"
+        :description="activeBasePoint.north === null || activeBasePoint.east === null ? '该基点坐标未补齐，新登记器物将挂起，等测绘组确认后才能对账进库。' : ''"
+      />
       <el-form label-width="100px" class="form">
         <el-row :gutter="12">
           <el-col :span="8">
@@ -304,10 +424,25 @@ function exportList(): void {
       <el-select v-model="filterCategory" placeholder="全部类别" clearable style="width: 130px">
         <el-option v-for="item in ARTIFACT_CATEGORIES" :key="item" :label="item" :value="item" />
       </el-select>
+      <el-select v-model="filterStatus" placeholder="全部状态" clearable style="width: 140px">
+        <el-option
+          v-for="item in (['recorded', 'archived', 'held'] as ArtifactStatus[])"
+          :key="item"
+          :label="ARTIFACT_STATUS_LABEL[item]"
+          :value="item"
+        />
+      </el-select>
       <el-tag type="info" effect="plain">命中 {{ visible.length }} 条 · 合计 {{ totalCount }} 件</el-tag>
+      <el-tag type="warning" effect="plain">未归档 {{ pendingCount }}</el-tag>
+      <el-tag type="danger" effect="plain">挂起 {{ heldCount }}</el-tag>
+      <span class="toolbar-spacer" />
+      <el-button type="primary" plain size="small" @click="reconcileNow">与基点记录对账</el-button>
+      <el-button type="success" plain size="small" @click="archiveSelected">进库并冻结坐标</el-button>
+      <el-button type="warning" plain size="small" @click="releaseSelected">测绘组已确认·解除挂起</el-button>
     </div>
 
-    <el-table :data="visible" border stripe row-key="id">
+    <el-table :data="visible" border stripe row-key="id" @selection-change="(rows: Artifact[]) => (selectedIds = rows.map((item) => item.id))">
+      <el-table-column type="selection" width="42" />
       <el-table-column prop="code" label="器物编号" width="140" />
       <el-table-column label="探方" width="150">
         <template #default="{ row }: { row: Artifact }">
@@ -330,15 +465,40 @@ function exportList(): void {
         </template>
       </el-table-column>
       <el-table-column prop="category" label="类别" width="90" />
-      <el-table-column prop="count" label="件数" width="80" />
-      <el-table-column prop="completeness" label="残整" width="90" />
-      <el-table-column label="出土坐标 (X,Y,Z)" width="170">
+      <el-table-column prop="count" label="件数" width="70" />
+      <el-table-column prop="completeness" label="残整" width="80" />
+      <el-table-column label="平面读数 (X,Y,Z)" width="160">
         <template #default="{ row }: { row: Artifact }">{{ row.x }}, {{ row.y }}, {{ row.z }}</template>
       </el-table-column>
-      <el-table-column prop="date" label="出土日期" width="120" />
-      <el-table-column prop="collector" label="提取人" width="90" />
-      <el-table-column prop="tempLocation" label="临时存放" min-width="140" show-overflow-tooltip />
-      <el-table-column label="操作" width="130" fixed="right">
+      <el-table-column label="量算基点" width="130">
+        <template #default="{ row }: { row: Artifact }">
+          <span v-if="basePointOf(row)" class="mono">{{ basePointLabel(basePointOf(row)!) }}</span>
+          <el-tag v-else type="danger" size="small" effect="plain">未挂基点</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column label="对账状态" width="110">
+        <template #default="{ row }: { row: Artifact }">
+          <el-tag :type="statusType(row.status)" size="small">{{ ARTIFACT_STATUS_LABEL[row.status] }}</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column label="进库冻结/重算坐标" min-width="230">
+        <template #default="{ row }: { row: Artifact }">
+          <div v-if="row.status === 'archived'" class="coord-cell">
+            <span class="mono">进库 N{{ row.frozenNorth }} / E{{ row.frozenEast }}</span>
+            <span class="muted">（基点再改不重算）</span>
+          </div>
+          <div v-else-if="globalOf(row)" class="coord-cell">
+            <span class="mono">重算 N{{ globalOf(row)?.north }} / E{{ globalOf(row)?.east }}</span>
+          </div>
+          <el-tooltip v-else-if="row.holdNote" :content="row.holdNote" placement="top">
+            <el-tag type="danger" size="small" effect="plain">{{ row.holdNote }}</el-tag>
+          </el-tooltip>
+        </template>
+      </el-table-column>
+      <el-table-column prop="date" label="出土日期" width="110" />
+      <el-table-column prop="collector" label="提取人" width="80" />
+      <el-table-column prop="tempLocation" label="临时存放" min-width="130" show-overflow-tooltip />
+      <el-table-column label="操作" width="120" fixed="right">
         <template #default="{ row }: { row: Artifact }">
           <el-button link type="primary" size="small" @click="openEdit(row)">编辑</el-button>
           <el-button link type="danger" size="small" @click="remove(row)">删除</el-button>
@@ -368,5 +528,17 @@ function exportList(): void {
 }
 .actions {
   padding-left: 100px;
+}
+.bp-banner {
+  margin-bottom: 10px;
+}
+.toolbar-spacer {
+  flex: 1;
+}
+.coord-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
 }
 </style>

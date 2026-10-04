@@ -6,6 +6,7 @@ import { trenchStore } from '@/stores/trenchStore'
 import { stratumStore } from '@/stores/stratumStore'
 import { artifactStore } from '@/stores/artifactStore'
 import { relationStore } from '@/stores/relationStore'
+import { basePointStore } from '@/stores/basePointStore'
 
 const route = useRoute()
 const trenchState = useStore(trenchStore)
@@ -32,6 +33,7 @@ const stats = computed(() => [
 
 onMounted(async () => {
   await trenchStore.getState().hydrate()
+  await basePointStore.getState().hydrate()
   await stratumStore.getState().hydrate()
   await artifactStore.getState().hydrate()
   await relationStore.getState().hydrate()

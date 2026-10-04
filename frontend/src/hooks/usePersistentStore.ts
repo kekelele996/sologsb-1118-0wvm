@@ -1,22 +1,24 @@
 import { onUnmounted, reactive } from 'vue'
 import type { StoreApi } from 'zustand/vanilla'
 import Dexie, { type Table } from 'dexie'
-import type { Artifact, Relation, Stratum, Trench } from '@/types'
+import type { Artifact, BasePoint, Relation, Stratum, Trench } from '@/types'
+import { isBasePointComplete, parseBasePointNote } from '@/types'
 
 /** IndexedDB 数据结构版本号 */
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 export interface MetaRow {
   key: string
   value: number
 }
 
-/** Dexie 封装：探方 / 地层单位 / 出土物 / 层位关系 四张表 + 元数据表 */
+/** Dexie 封装：探方 / 地层单位 / 出土物 / 层位关系 / 基点版本 五张表 + 元数据表 */
 class TrenchLogDb extends Dexie {
   trenches!: Table<Trench, string>
   strata!: Table<Stratum, string>
   artifacts!: Table<Artifact, string>
   relations!: Table<Relation, string>
+  basePoints!: Table<BasePoint, string>
   meta!: Table<MetaRow, string>
 
   constructor() {
@@ -26,6 +28,7 @@ class TrenchLogDb extends Dexie {
       strata: 'id, trenchId, code, type',
       artifacts: 'id, stratumId, code, category',
       relations: 'id, unitAId, unitBId, type',
+      basePoints: 'id, trenchId, version, active',
       meta: 'key'
     })
     // v2：地层单位新增「开口层位」字段，迁移时为历史数据补齐默认值
@@ -48,6 +51,63 @@ class TrenchLogDb extends Dexie {
             if (!Array.isArray(stratum.inclusions)) {
               stratum.inclusions = []
             }
+          })
+      })
+    // v3：测绘组基点独立成「基点版本台账」；器物增加基点版本、对账状态与进库冻结坐标。
+    // 旧数据没有基点版本，升级时按各探方当时基点补齐 v1，并把历史器物挂到该版本上。
+    this.version(SCHEMA_VERSION)
+      .stores({
+        trenches: 'id, code, area, backfilled',
+        strata: 'id, trenchId, code, type, topDepth',
+        artifacts: 'id, stratumId, code, category, date, status, basePointId',
+        relations: 'id, unitAId, unitBId, type, basis',
+        basePoints: 'id, trenchId, version, active',
+        meta: 'key'
+      })
+      .upgrade(async (tx) => {
+        const basePointsTable = tx.table<BasePoint, string>('basePoints')
+
+        // 旧数据没有基点版本：先读各探方当时基点，补齐 v1（只追加，不改探方记录）
+        const trenches = await tx.table<Trench, string>('trenches').toArray()
+        const strata = await tx.table<Stratum, string>('strata').toArray()
+        const basePoints: BasePoint[] = trenches.map((trench) => {
+          const { north, east } = parseBasePointNote(trench.basePoint ?? '')
+          return {
+            id: `bp_${trench.id}_v1`,
+            trenchId: trench.id,
+            version: 1,
+            north,
+            east,
+            elevation: null,
+            note: trench.basePoint ?? '',
+            recorder: '',
+            effectiveDate: trench.startDate ?? '',
+            active: true
+          }
+        })
+        await basePointsTable.bulkPut(basePoints)
+
+        const trenchById = new Map(trenches.map((item) => [item.id, item]))
+        const trenchIdByStratum = new Map(strata.map((item) => [item.id, item.trenchId]))
+        const basePointIdByTrench = new Map(basePoints.map((item) => [item.trenchId, item.id]))
+
+        // 历史器物挂到其探方当时基点 v1；基点只有文字、解析不出坐标的先挂起，补录后再对账
+        await tx
+          .table<Artifact, string>('artifacts')
+          .toCollection()
+          .modify((artifact) => {
+            if (artifact.status) return
+            const trenchId = trenchIdByStratum.get(artifact.stratumId) ?? ''
+            const basePointId = basePointIdByTrench.get(trenchId) ?? null
+            const trench = trenchById.get(trenchId)
+            const parsed = trench ? parseBasePointNote(trench.basePoint ?? '') : { north: null, east: null }
+            const complete = isBasePointComplete(parsed)
+            artifact.basePointId = basePointId
+            artifact.status = complete ? 'recorded' : 'held'
+            artifact.frozenNorth = null
+            artifact.frozenEast = null
+            artifact.recalcIssue = complete ? null : 'incomplete-basepoint'
+            artifact.holdNote = complete ? '' : '旧数据基点坐标未补齐，按当时基点补录后方可对账进库'
           })
       })
   }
@@ -180,6 +240,33 @@ export async function seedDemoData(): Promise<void> {
     }
   ])
 
+  await db.basePoints.bulkPut([
+    {
+      id: 'bp_tr_0501_v1',
+      trenchId: 'tr_0501',
+      version: 1,
+      north: 1200,
+      east: 3000,
+      elevation: 46.2,
+      note: 'N1200 / E3000',
+      recorder: '测绘组·岳衡',
+      effectiveDate: today,
+      active: true
+    },
+    {
+      id: 'bp_tr_0502_v1',
+      trenchId: 'tr_0502',
+      version: 1,
+      north: 1205,
+      east: 3000,
+      elevation: 46.1,
+      note: 'N1205 / E3000',
+      recorder: '测绘组·岳衡',
+      effectiveDate: today,
+      active: true
+    }
+  ])
+
   await db.artifacts.bulkPut([
     {
       id: 'af_001',
@@ -193,7 +280,13 @@ export async function seedDemoData(): Promise<void> {
       z: 0.42,
       date: today,
       collector: '祁野',
-      tempLocation: '工地临时柜 A-2'
+      tempLocation: '工地临时柜 A-2',
+      basePointId: 'bp_tr_0501_v1',
+      status: 'recorded',
+      frozenNorth: null,
+      frozenEast: null,
+      recalcIssue: null,
+      holdNote: ''
     },
     {
       id: 'af_002',
@@ -207,7 +300,13 @@ export async function seedDemoData(): Promise<void> {
       z: 1.05,
       date: today,
       collector: '祁野',
-      tempLocation: '工地临时柜 A-3'
+      tempLocation: '工地临时柜 A-3',
+      basePointId: 'bp_tr_0501_v1',
+      status: 'archived',
+      frozenNorth: 1203.6,
+      frozenEast: 3003.1,
+      recalcIssue: null,
+      holdNote: ''
     }
   ])
 
