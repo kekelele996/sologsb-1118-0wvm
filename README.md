@@ -57,11 +57,11 @@ sologsb-1118/
 │   ├── nginx.conf              # try_files 前端路由回落 + gzip
 │   ├── public/favicon.svg
 │   └── src/
-│       ├── types/              # trench.ts / stratum.ts / artifact.ts / relation.ts / index.ts
-│       ├── stores/             # trenchStore / stratumStore / artifactStore / relationStore（Zustand）
+│       ├── types/              # basePoint.ts / trench.ts / stratum.ts / artifact.ts / relation.ts / index.ts
+│       ├── stores/             # basePointStore / trenchStore / stratumStore / artifactStore / relationStore（Zustand）
 │       ├── components/common/  # StratumDepthBar / RelationGraph / TrenchTag / UnitPicker
 │       ├── hooks/              # useStratumOrder / useRelationGraph / usePersistentStore
-│       ├── pages/              # TrenchesPage / StrataPage / ArtifactsPage / RelationsPage / SectionsPage
+│       ├── pages/              # TrenchesPage / SurveyPage / StrataPage / ArtifactsPage / RelationsPage / SectionsPage
 │       ├── router/index.ts
 │       └── utils/              # graph.ts / export.ts / id.ts
 ```
@@ -70,22 +70,36 @@ sologsb-1118/
 
 | 模型 | 说明 | Dexie 表 |
 | --- | --- | --- |
-| Trench 探方 | 探方号、发掘区、规格、基点坐标、开口层位、发掘起止、负责人、四壁备注、是否回填 | `trenches` |
+| BasePointVersion 基点版本 | **测绘组持**：探方基点 N/E/高程、版本号、生效日期、测绘人、改版/勘误说明、是否现行 | `basePoints` |
+| Trench 探方 | 探方号、发掘区、规格、基点文本（以基点台账为准）、开口层位、发掘起止、负责人、四壁备注、是否回填 | `trenches` |
 | Stratum 地层单位 | 单位号、类型（地层/灰坑/房址/沟/墓葬）、开口层位、上下界深度、土质土色、包含物、堆积成因、绘图拍照号 | `strata` |
-| Artifact 出土物 | 所属地层单位、器物编号、类别、件数、残整程度、探方内 X/Y/Z、出土日期、提取人、临时存放 | `artifacts` |
+| Artifact 出土物 | **整理室持**：所属地层单位、器物编号、类别、件数、残整程度、相对基点的平面读数 X/Y/Z、读数基点版本、台账状态（未归档/已进库/挂起/重算失败）、进库冻结绝对坐标、存放位置、挂起原因 | `artifacts` |
 | Relation 层位关系 | 单位 A、关系类型（叠压/打破/共存）、单位 B、判定依据、记录人、备注 | `relations` |
 
 - 数据库名 `gbtrenchlog`，`meta` 表保存 `schemaVersion`；
 - `version(2)` 升级迁移会为历史地层单位补齐「开口层位」字段并规范包含物数组；
+- `version(3)` 新增 `basePoints` 基点版本表：**旧数据没基点版本，升级时按当时登记基点为每个探方补 v1 基点**，旧器物按该基点补版本号并视作已进库、冻结其绝对坐标（历史坐标不被改写）；基点文本无法解析的暂记 (0,0) 并留痕，等测绘组勘误；
 - 数据仅存于浏览器本地，容器无状态、不挂载命名卷。
+
+### 基点改算与进库对账规则（测绘组 ↔ 整理室双账）
+
+两边各持一份：**测绘组管基点坐标和换算基准，整理室管器物编号、平面读数和存放位置**。
+
+1. 探方基点由测绘组定，改版即升版本：旧版本自动归档（不删除），新版本现行；历史版本可勘误并留痕。
+2. 器物平面读数按整理室量取时的基点版本登记（`baseVersion`）。换算基准：`新读数 = 旧读数 +（旧基点 − 新基点）`，保证物理位置不变。
+3. 测绘组改基点后，**没归档（未进库）的器物读数要按新基点重算**；在「基点与对账」页对该探方批量执行。
+4. **已进库器物的绝对坐标在进库时冻结，不随基点改版变化**；页面按其冻结时的基点版本重算并与冻结值对账（容差 0.01 m）。
+5. **对不上的挂起，等测绘组确认，先不进库**；测绘确认后可选「确认进库」（以现行基点记录为准冻结）或「退回重测」（回到未归档重新量取）。
+6. 重算只动整理室那份：找不到旧基点版本等失败仅标记在器物上（状态 `failed`），**基点补齐后只重试失败件**，不回写测绘台账。
 
 ## 六、主要页面
 
 | 路由 | 功能 |
 | --- | --- |
-| `/trenches` | 探方清单：按「发掘区-探方号」校验唯一性，卡片显示单位数、出土物件数、关系数与发掘进度状态 |
+| `/trenches` | 探方清单：按「发掘区-探方号」校验唯一性，卡片显示单位数、出土物件数、关系数、当前基点版本、挂起/失败件数与发掘进度状态 |
+| `/survey` | **基点与对账（测绘）**：基点版本台账与改基点升版、历史版本勘误；未进库读数按新基点重算 / 只重试失败件；已进库器物冻结坐标与基点记录对账、挂起件测绘确认 |
 | `/strata` | 地层单位编目表：按类型与深度区间筛选，层序倒置与单位号重复即时高亮，深度刻度条展示厚度 |
-| `/artifacts` | 出土物登记与清单：先锁定所属地层单位（级联选择器），带出深度区间并校验出土深度是否在该区间内 |
+| `/artifacts` | 出土物登记与清单：先锁定所属地层单位（级联选择器），读数按当前基点版本登记并带出深度区间校验；进库前对账、对不上挂起；已进库坐标冻结只可改档案 |
 | `/relations` | 层位关系视图：SVG 有向图展示叠压/打破，点击节点高亮直接关系，新增关系前做环路检测 |
 | `/sections` | 四壁剖面示意：按深度刻度绘制地层条带与厚度标注，叠加出土物投影点 |
 

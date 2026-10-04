@@ -1,20 +1,25 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { Trench } from '@/types'
-import { TRENCH_SIZES, findTrenchConflict, trenchKey } from '@/types'
+import { TRENCH_SIZES, findTrenchConflict, formatBasePoint, trenchKey } from '@/types'
 import TrenchTag from '@/components/common/TrenchTag.vue'
 import { useStore } from '@/hooks/usePersistentStore'
 import { trenchStore } from '@/stores/trenchStore'
 import { stratumStore } from '@/stores/stratumStore'
 import { artifactStore } from '@/stores/artifactStore'
 import { relationStore } from '@/stores/relationStore'
+import { basePointStore } from '@/stores/basePointStore'
+import { currentBasePoint } from '@/types'
 import { uid } from '@/utils/id'
 
+const router = useRouter()
 const trenchState = useStore(trenchStore)
 const stratumState = useStore(stratumStore)
 const artifactState = useStore(artifactStore)
 const relationState = useStore(relationStore)
+const basePointState = useStore(basePointStore)
 
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
@@ -69,6 +74,19 @@ function progressOf(trench: Trench): { label: string; type: 'success' | 'warning
   if (unitsOf(trench.id) === 0) return { label: '待发掘', type: 'warning' }
   if (trench.endDate) return { label: '发掘完成', type: 'success' }
   return { label: '发掘中', type: 'success' }
+}
+
+/** 基点台账当前版本（基点坐标由测绘组定） */
+function basePointOf(trench: Trench) {
+  const current = currentBasePoint(basePointState.versions, trench.id)
+  if (!current) return null
+  return { version: current.version, text: `${formatBasePoint(current)} · 高程 ${current.elevation} m` }
+}
+
+/** 本探方挂起/重算失败件数，提示去对账页处理 */
+function holdCountOf(trenchId: string): number {
+  const unitIds = new Set(stratumState.strata.filter((item) => item.trenchId === trenchId).map((item) => item.id))
+  return artifactState.artifacts.filter((item) => unitIds.has(item.stratumId) && (item.status === 'suspended' || item.status === 'failed')).length
 }
 
 function resetForm(): void {
@@ -182,7 +200,27 @@ async function remove(trench: Trench): Promise<void> {
           <div class="metric"><span>规格</span><b>{{ trench.size }}</b></div>
         </div>
         <el-descriptions :column="1" size="small" border class="desc">
-          <el-descriptions-item label="基点坐标">{{ trench.basePoint || '—' }}</el-descriptions-item>
+          <el-descriptions-item label="基点坐标">
+            <template v-if="basePointOf(trench)">
+              <el-tag size="small" type="success" effect="plain">v{{ basePointOf(trench)?.version }}</el-tag>
+              <span class="mono">{{ basePointOf(trench)?.text }}</span>
+              <el-button link type="primary" size="small" @click="router.push({ path: '/survey', query: { trench: trench.id } })">
+                基点与对账
+              </el-button>
+            </template>
+            <template v-else>
+              <span class="muted">测绘组尚未建立基点记录</span>
+              <el-button link type="primary" size="small" @click="router.push({ path: '/survey', query: { trench: trench.id } })">
+                去建立
+              </el-button>
+            </template>
+          </el-descriptions-item>
+          <el-descriptions-item label="对账状态">
+            <el-tag v-if="holdCountOf(trench.id) > 0" type="danger" size="small" effect="plain">
+              {{ holdCountOf(trench.id) }} 件挂起/失败，等测绘确认
+            </el-tag>
+            <el-tag v-else type="success" size="small" effect="plain">无挂起</el-tag>
+          </el-descriptions-item>
           <el-descriptions-item label="开口层位">{{ trench.openLayer || '—' }}</el-descriptions-item>
           <el-descriptions-item label="发掘日期">
             {{ trench.startDate }} ~ {{ trench.endDate || '进行中' }}
@@ -306,5 +344,12 @@ async function remove(trench: Trench): Promise<void> {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+.muted {
+  color: #a59a8b;
 }
 </style>
